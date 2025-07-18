@@ -1,9 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim import Adam
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import torchvision.transforms.functional as F2
+from torchvision.transforms.functional import to_pil_image
 
 import argparse
 
@@ -16,7 +17,7 @@ from utils import save_img_and_text
 
 device = 'cuda' if torch.cuda.is_available else 'cpu'
 
-def uap_sgd(model, model_name, encoder, tokenizer, image_processor, image_mean, image_std, clip_model, loader, nb_epoch, eps, c = 0.1, targeted=False, lr=0.01, nb_imgs=1000):
+def uap_sgd(model, model_name, encoder, tokenizer, image_processor, image_mean, image_std, clip_model, loader, nb_epoch, eps, c = 0.1, targeted=True, lr=0.01, nb_imgs=1000):
     '''
     INPUT
     model       model
@@ -31,7 +32,7 @@ def uap_sgd(model, model_name, encoder, tokenizer, image_processor, image_mean, 
     total_losses = []
     clip_losses = []
     # image encoder
-    encoder = encoder.cuda()
+    encoder = encoder.to(device)
     # imgs counter
     imgs_counter = 0
     for i, batch in enumerate(loader):
@@ -58,7 +59,7 @@ def uap_sgd(model, model_name, encoder, tokenizer, image_processor, image_mean, 
         cos_sim = F.cosine_similarity(pred_texts_features, true_texts_features)
 
         # If the prediction is not close to the ground truth, continue
-        if cos_sim[0] < 0.7 or cos_sim[1] < 0.7 or len(y[0]) > 76 or len(y[1]) > 76:
+        if cos_sim.min() < 0.7 or any(len(t) > 76 for t in y):
             continue
         
         with torch.no_grad():
@@ -68,26 +69,28 @@ def uap_sgd(model, model_name, encoder, tokenizer, image_processor, image_mean, 
         clip_score_before = F.cosine_similarity(x_true_emb, y_true_emb).mean()
         
         imgs_counter += 1
-        if imgs_counter == nb_imgs:
+        if imgs_counter > nb_imgs:
             break
         
         # Create a noise tensor
-        noise = torch.zeros_like(x[0].unsqueeze(0), device=device, requires_grad=True)
+        noise = torch.zeros_like(x[0:1], device=device, dtype=x.dtype , requires_grad=True)
         # Define the optimizer
-        optimizer = Adam([noise], lr=lr)
+        optimizer = AdamW([noise], lr=lr, weight_decay=1e-4)
         # Define the scheduler
-        scheduler = ReduceLROnPlateau(optimizer=optimizer, patience=30, factor=0.1, cooldown=30)
+        scheduler = CosineAnnealingLR(optimizer, T_max=nb_epoch)
         
         # Save the original target image embedding
         with torch.no_grad():
-            x_emb = encoder(x)[1][0].detach()
+            x_pil = [to_pil_image(img.cpu()) for img in x]
+            x_enc = image_processor(images=x_pil, return_tensors="pt").pixel_values.to(device, dtype=torch.float16)
+            x_emb = encoder(x_enc).pooler_output[0].detach()
             
         save_img_and_text(F2.resize(x[0], (224, 224)), model_orig_pred[0], image_mean, image_std, eps, i, target_img=True, targeted=True, adv=False)
         save_img_and_text(F2.resize(x[1], (224, 224)), model_orig_pred[1], image_mean, image_std, eps, i, target_img=False, targeted=True, adv=False)
         print(f'Cos sim: {cos_sim.mean().item():.4f}')
         print(f'Pred: {model_orig_pred}')
-        print(f'Orig: {y[1]}')
-        print(f'Target: {y[0]}')
+        print(f'Orig: {y}')
+        #print(f'Target: {y[0]}')
         
         cur_losses = []
         
@@ -97,32 +100,35 @@ def uap_sgd(model, model_name, encoder, tokenizer, image_processor, image_mean, 
             optimizer.zero_grad()
             # Add the noise to the input
             # x_adv = torch.clamp((x[1] + noise).cuda(), -1, 1)
-            x_adv = (x[1] + noise).cuda()
-            # Embed the perturbed image
-            x_adv_emb = encoder(x_adv)[1]
+            x_adv = (x[1:2] + noise).to(device)
+            # BLIP-2 embedding
+            x_adv_pil = [to_pil_image(x_adv.cpu()[0])]
+            x_adv_enc = image_processor(images=x_adv_pil, return_tensors="pt").pixel_values.to(device, dtype=torch.float16)
+            x_adv_emb = encoder(x_adv_enc).pooler_output
             # L2 distance
-            l2_dist = torch.norm((noise).view(len(noise), -1), p=2, dim=1)
+            l2_dist = torch.norm(noise.view(noise.shape[0], -1), p=2, dim=1)
 
             if not targeted:
-                untargeted_loss = nn.CosineSimilarity()(x_adv_emb, x_emb).mean()
+                untargeted_loss = F.CosineSimilarity(x_adv_emb, x_emb.unsqueeze(0)).mean()
                 loss = untargeted_loss + c * l2_dist
             else:
-                targeted_loss = 1 - nn.CosineSimilarity()(x_adv_emb, x_emb).mean()
+                targeted_loss = 1 - F.CosineSimilarity(x_adv_emb, x_emb.unsqueeze(0)).mean()
                 loss = targeted_loss + c * l2_dist
                         
             # Backpropagate the gradients
             loss.backward()
             # Step according to gradient
+            torch.nn.utils.clip_grad_norm_([noise], max_norm=1.0) 
             optimizer.step()
             # Scheduler step
-            scheduler.step(loss)
+            scheduler.step()
             # Project to epsilon ball
             noise.data.clamp_(-eps, eps)
             # Save loss
-            cur_losses.append(loss.data.item())
+            cur_losses.append(loss.item())
             
-            if epoch % 100 == 99:
-                print(f'Epoch #{epoch+1} loss: {loss.data[0]:.4f}')
+            if (epoch + 1) % 100 == 0:
+                print(f"   Epoch {epoch+1}/{nb_epoch}, loss={loss.item():.4f}, score={score.item():.4f}")
             
         adv_pred = predict(model_name, model, tokenizer, image_processor, x_adv)
         print(f'After attack:\n\t{adv_pred}')
@@ -130,23 +136,22 @@ def uap_sgd(model, model_name, encoder, tokenizer, image_processor, image_mean, 
         adv_tokenized = clip.tokenize(adv_pred).cuda()
         with torch.no_grad():
             y_adv_emb = clip_model.encode_text(adv_tokenized) 
-            x_adv_emb = clip_model.encode_image(F2.resize(x_adv, (224, 224), antialias=True))
+            x_adv_im_emb = clip_model.encode_image(F2.resize(x_adv, (224, 224), antialias=True))
         
         clip_score_after = F.cosine_similarity(x_adv_emb, y_adv_emb).mean()
         
-        save_img_and_text(F2.resize(x_adv[0], (224, 224)), adv_pred, image_mean, image_std, eps, i, target_img=False, targeted=True, adv=True)
+        save_img_and_text(F2.resize(x_adv[0], (224, 224)), adv_pred, image_mean, image_std, eps, i, target_img=False, targeted=targeted, adv=True)
         total_losses.append(cur_losses)
-        clip_losses.append((clip_score_before, clip_score_after))
-        print(f'Total current losses: {cur_losses}')
-        print(f'CLIP loss before and after: {clip_score_before, clip_score_after}')
+        clip_losses.append((clip_score_before.item(), clip_score_after.item()))
+        print(f'CLIP loss before {clip_score_before:.4f} and after {clip_score_after:.4f}\n')
         
         torch.cuda.empty_cache()
         
     return total_losses, clip_losses
 
 if __name__ == '__main__':    
-    parser = argparse.ArgumentParser(description="Image-to-Text Attack")
-    parser.add_argument("--model", type=str, help="Model name (str)", default='blip')
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, help="Model name (str)", default='blip2')
     parser.add_argument("--dataset", type=str, help="Dataset name (str)", default='flickr30k')
     parser.add_argument("--eps", type=float, help="Epsilon value (float)", default=50/255)
     parser.add_argument("--n_epochs", type=int, help="Number of epochs (int)", default=1000)
@@ -160,8 +165,8 @@ if __name__ == '__main__':
     n_imgs      = args.n_imgs
 
     clip_model, clip_preprocessor = clip.load("ViT-B/32", device='cuda')
-    image_processor, tokenizer, model, encoder, image_mean, image_std = load_model(model_name=model_name)
-    dataloader = load_dataset(dataset, image_processor, batch_size=6)
+    image_processor, tokenizer, model, encoder, image_mean, image_std = load_model(model_name=args.model)
+    dataloader = load_dataset(args.dataset, image_processor, batch_size=6)
     
     total_losses, clip_losses = uap_sgd(model=model,
                                         model_name=model_name,

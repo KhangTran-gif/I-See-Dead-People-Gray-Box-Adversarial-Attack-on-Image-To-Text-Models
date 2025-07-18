@@ -1,8 +1,11 @@
 from transformers import ViTImageProcessor, AutoTokenizer, VisionEncoderDecoderModel
 from transformers import BlipProcessor, BlipForConditionalGeneration
+from transformers import Blip2Processor, Blip2ForConditionalGeneration
 import torchvision.transforms as transforms
 from torchvision.utils import save_image
 from torch.utils.data import DataLoader
+from torchvision.transforms.functional import to_pil_image
+
 from PIL import Image
 import pandas as pd
 import numpy as np
@@ -56,6 +59,15 @@ def load_model(model_name):
             model = BlipForConditionalGeneration.from_pretrained(loc).eval().cuda()
             tokenizer = None
             encoder = model.vision_model
+        case 'blip2':
+            loc = "Salesforce/blip2-flan-t5-xl"
+            processor = Blip2Processor.from_pretrained(loc, use_fast=False)
+            model = Blip2ForConditionalGeneration.from_pretrained(loc)
+            model.eval()
+            mean = processor.image_mean
+            std = processor.image_std
+            tokenizer = None
+            encoder = model.vision_model
         case _:
             raise Exception('No such model {model_name}')
     return processor, tokenizer, model, encoder, mean, std
@@ -98,7 +110,7 @@ def save_img_and_text(img, text, image_mean, image_std, eps, i, target_img=False
         f.write(f'Original pred: {text}\n')
         f.close()
     
-def predict(model_name, model, tokenizer, feature_extractor, image):
+def predict(model_name, model, tokenizer, processor, image):
     
     # pixel_values = feature_extractor(images=image, return_tensors="pt").pixel_values
     # pixel_values = pixel_values.cuda()
@@ -112,14 +124,23 @@ def predict(model_name, model, tokenizer, feature_extractor, image):
         case 'blip':
             with torch.no_grad():
                 if image.shape[0] == 2:
-                    output_ids1 = model.generate(image[0].unsqueeze(0), max_length=16, num_beams=4, return_dict_in_generate=True).sequences
-                    output_ids2 = model.generate(image[1].unsqueeze(0), max_length=16, num_beams=4, return_dict_in_generate=True).sequences
-                    preds1 = feature_extractor.tokenizer.decode(output_ids1[0], skip_special_tokens=True)
-                    preds2 = feature_extractor.tokenizer.decode(output_ids2[0], skip_special_tokens=True)
+                    output_ids1 = model.generate(image[0].unsqueeze(0), max_length=16, num_beams=4).sequences
+                    output_ids2 = model.generate(image[1].unsqueeze(0), max_length=16, num_beams=4).sequences
+                    preds1 = processor.tokenizer.decode(output_ids1[0], skip_special_tokens=True)
+                    preds2 = processor.tokenizer.decode(output_ids2[0], skip_special_tokens=True)
                     preds = [preds1, preds2] 
                 else:
-                    output_ids1 = model.generate(image[0].unsqueeze(0), max_length=16, num_beams=4, return_dict_in_generate=True).sequences
-                    preds = feature_extractor.tokenizer.decode(output_ids1[0], skip_special_tokens=True)
+                    output_ids1 = model.generate(image[0].unsqueeze(0), max_length=16, num_beams=4).sequences
+                    preds = processor.tokenizer.decode(output_ids1[0], skip_special_tokens=True)
+        case 'blip2':
+            # BLIP-2 expects PIL input
+            pil_images = [to_pil_image(im.cpu()) for im in image]
+            inputs = processor(images=pil_images, return_tensors="pt").to(model.device, torch.float16)
+            with torch.no_grad():
+                generated_ids = model.generate(**inputs, max_new_tokens=30)
+            preds = processor.batch_decode(generated_ids, skip_special_tokens=True)
+            preds = [p.strip() for p in preds]
+
     return preds
 
 def make_df(labels):
