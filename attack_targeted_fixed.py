@@ -6,6 +6,9 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torchvision.transforms.functional import to_pil_image
 from torchvision import transforms
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+
 
 import argparse
 import clip
@@ -19,11 +22,16 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 resize_224 = transforms.Resize((224, 224), antialias=True)
 
-def pgd(model, model_name, encoder, tokenizer, image_processor, image_mean, image_std, clip_model, loader, nb_epoch, eps, c = 0.1, targeted=True, lr=0.05, nb_imgs=1000, projection=None):
+def sbert_similarity(sent1, sent2, model):
+    embeddings = model.encode([sent1, sent2], convert_to_tensor=True, device=device)
+    return F.cosine_similarity(embeddings[0], embeddings[1], dim=0)
+
+def pgd(model, model_name, encoder, tokenizer, image_processor, image_mean, image_std, clip_model, sbert_model, loader, nb_epoch, eps, c = 0.1, targeted=True, lr=0.05, nb_imgs=1000, 
+        projection=None, clip_weight = 0.6, sbert_weight = 0.4):
     total_losses = []
     clip_losses = []
     encoder = encoder.to(device)
-
+    sbert_model = sbert_model.to(device)
     if projection is not None:
         projection = projection.to(device)
 
@@ -92,18 +100,27 @@ def pgd(model, model_name, encoder, tokenizer, image_processor, image_mean, imag
             x_adv_normalized = (x_adv_resized - mean) / std
             x_adv_normalized = x_adv_normalized.to(dtype=torch.float16)
 
-            #x_adv_enc = image_processor(images=[to_pil_image(img.cpu()) for img in x_adv_resized], return_tensors="pt", do_rescale=False).pixel_values.to(device, dtype=torch.float16)
             x_adv_emb = encoder(x_adv_normalized).pooler_output
             x_adv_proj = projection(x_adv_emb.float()) if projection else x_adv_emb.float()
 
             l2_dist = torch.norm(noise.view(noise.shape[0], -1), p=2, dim=1)
 
+            # Compute projection loss (CLIP)
             if not targeted:
-                untargeted_loss = F.cosine_similarity(x_adv_proj, x_emb_proj.unsqueeze(0)).mean()
-                loss = untargeted_loss + c * l2_dist
+                clip_loss = F.cosine_similarity(x_adv_proj, x_emb_proj.unsqueeze(0)).mean()
             else:
-                targeted_loss = 1 - F.cosine_similarity(x_adv_proj, x_emb_proj.unsqueeze(0)).mean()
-                loss = targeted_loss + c * l2_dist
+                clip_loss = 1 - F.cosine_similarity(x_adv_proj, x_emb_proj.unsqueeze(0)).mean()
+
+            # Compute Sentence-BERT loss (targeted)
+            with torch.no_grad():
+                adv_pred_text = predict(model_name, model, tokenizer, image_processor, x_adv)[0]
+                target_text = y[0]
+
+            sbert_embeds = sbert_model.encode([adv_pred_text, target_text], convert_to_tensor=True, device=device)
+            sbert_sim = F.cosine_similarity(sbert_embeds[0], sbert_embeds[1], dim=0)
+            sbert_loss = (1 - sbert_sim) if targeted else sbert_sim
+
+            loss = clip_weight * clip_loss + sbert_weight * sbert_loss + c * l2_dist
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_([noise], max_norm=1.0)
@@ -115,7 +132,7 @@ def pgd(model, model_name, encoder, tokenizer, image_processor, image_mean, imag
             if (epoch + 1) % 100 == 0:
                 #print(f"   Epoch {epoch+1}/{nb_epoch}, loss={loss.item():.4f}")
                 max_abs_noise = noise.data.abs().max().item()
-                print(f"   Epoch {epoch+1}/{nb_epoch}, loss={loss.item():.4f}, target_loss={targeted_loss.item():.4f}, l2={l2_dist.item():.4f}, max_noise={max_abs_noise:.4f}")
+                print(f"   Epoch {epoch+1}/{nb_epoch}, loss={loss.item():.4f}, clip_loss={clip_loss.item():.4f}, sbert_loss={sbert_loss.item():.4f}, l2={l2_dist.item():.4f}, max_noise={max_abs_noise:.4f}")
 
         with torch.no_grad():
             adv_pred = predict(model_name, model, tokenizer, image_processor, x_adv)
@@ -151,12 +168,12 @@ if __name__ == '__main__':
     nb_epoch = args.n_epochs
     n_imgs = args.n_imgs
 
-    clip_model, clip_preprocessor = clip.load("ViT-B/32", device='cuda')
+    clip_model, clip_preprocessor = clip.load("ViT-B/32", device=device)
     image_processor, tokenizer, model, encoder, image_mean, image_std = load_model(model_name=model_name)
+    sbert_model = SentenceTransformer('all-MiniLM-L6-v2').to(device)
+    dataloader = load_dataset(dataset, image_processor, batch_size=6)
     image_mean = torch.tensor(image_mean).view(3, 1, 1).to(device)
     image_std = torch.tensor(image_std).view(3, 1, 1).to(device)
-
-    dataloader = load_dataset(dataset, image_processor, batch_size=6)
 
     if model_name == "blip2":
         projection = nn.Linear(1408, 512).to(device)
@@ -164,8 +181,8 @@ if __name__ == '__main__':
         projection = None
 
     total_losses, clip_losses = pgd(model, model_name, encoder, tokenizer, image_processor, image_mean, image_std,
-                                        clip_model, dataloader, nb_epoch, eps, c=0.1, targeted=True, lr=0.01,
-                                        nb_imgs=n_imgs, projection=projection)
+                                        clip_model, sbert_model, dataloader, nb_epoch, eps, c=0.1, targeted=True, lr=0.05,
+                                        nb_imgs=n_imgs, projection=projection, clip_weight = 0.6, sbert_weight = 0.4)
 
     mean_loss = sum(loss[-1] for loss in total_losses) / len(total_losses)
     print(f'Mean last loss: {mean_loss}')
