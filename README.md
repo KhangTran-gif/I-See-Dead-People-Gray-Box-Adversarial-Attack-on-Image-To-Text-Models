@@ -19,7 +19,7 @@ Modern image-to-text systems typically adopt the encoder-decoder framework, whic
 ## Run
     python attack_targeted.py/attack_untargeted.py --model=<model_name> --dataset=<dataset_name> --eps=<epsilon> --n_epochs=<num_epochs> --n_imgs=<n_images>
 
-    python attack_targeted.py --model=vit-gpt2 --dataset=flickr30k --eps=100 --n_epochs=1000 --n_imgs=1000
+    python attack_targeted.py --model=blip2 --dataset=flickr30k --eps=100 --n_epochs=1000 --n_imgs=1000
 
 - The values used in the paper are:
   - model=vit-gpt2

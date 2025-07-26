@@ -17,7 +17,7 @@ from utils import save_img_and_text
 
 device = 'cuda' if torch.cuda.is_available else 'cpu'
 
-def uap_sgd(model, model_name, encoder, tokenizer, image_processor, image_mean, image_std, clip_model, loader, nb_epoch, eps, c = 0.1, targeted=True, lr=0.01, nb_imgs=1000):
+def uap_sgd(model, model_name, encoder, tokenizer, image_processor, image_mean, image_std, clip_model, loader, nb_epoch, eps, c = 0.1, targeted=True, lr=0.01, nb_imgs=1000, loss_type='both'):
     '''
     INPUT
     model       model
@@ -94,6 +94,10 @@ def uap_sgd(model, model_name, encoder, tokenizer, image_processor, image_mean, 
         
         cur_losses = []
         
+        best_loss = float('inf')
+        patience = 30
+        counter = 0
+
         for epoch in range(nb_epoch):
             
             # Zero out the gradients
@@ -112,8 +116,9 @@ def uap_sgd(model, model_name, encoder, tokenizer, image_processor, image_mean, 
                 untargeted_loss = F.CosineSimilarity(x_adv_emb, x_emb.unsqueeze(0)).mean()
                 loss = untargeted_loss + c * l2_dist
             else:
-                targeted_loss = 1 - F.CosineSimilarity(x_adv_emb, x_emb.unsqueeze(0)).mean()
-                loss = targeted_loss + c * l2_dist
+                cosine =  F.CosineSimilarity(x_adv_emb, x_emb.unsqueeze(0)).mean()
+                mse = F.mse_loss(x_adv_emb, x_emb.unsqueeze(0))
+                loss = (1 - cosine) + 0.5 * mse
                         
             # Backpropagate the gradients
             loss.backward()
@@ -127,6 +132,16 @@ def uap_sgd(model, model_name, encoder, tokenizer, image_processor, image_mean, 
             # Save loss
             cur_losses.append(loss.item())
             
+            if loss.item() < best_loss:
+                best_loss = loss.item()
+                counter = 0
+            else:
+                counter += 1
+
+            if counter >= patience:
+                print(f"Early stopping at epoch {epoch}")
+                break
+
             if (epoch + 1) % 100 == 0:
                 print(f"   Epoch {epoch+1}/{nb_epoch}, loss={loss.item():.4f}, score={score.item():.4f}")
             
@@ -156,6 +171,7 @@ if __name__ == '__main__':
     parser.add_argument("--eps", type=float, help="Epsilon value (float)", default=50/255)
     parser.add_argument("--n_epochs", type=int, help="Number of epochs (int)", default=1000)
     parser.add_argument("--n_imgs", type=int, help="Number of images (int)", default=1000)
+    parser.add_argument("--loss_type", type=str, help="Loss type (cosine, mse, both)", default='both')
     args = parser.parse_args()
     
     model_name  = args.model

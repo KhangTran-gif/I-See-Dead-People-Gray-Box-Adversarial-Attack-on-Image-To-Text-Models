@@ -60,12 +60,12 @@ def load_model(model_name):
             tokenizer = None
             encoder = model.vision_model
         case 'blip2':
-            loc = "Salesforce/blip2-flan-t5-xl"
+            loc = "Salesforce/blip2-opt-2.7b"
             processor = Blip2Processor.from_pretrained(loc, use_fast=False)
-            model = Blip2ForConditionalGeneration.from_pretrained(loc)
+            model = Blip2ForConditionalGeneration.from_pretrained(loc, torch_dtype=torch.float16).cuda()
             model.eval()
-            mean = processor.image_mean
-            std = processor.image_std
+            mean = processor.image_processor.image_mean
+            std = processor.image_processor.image_std
             tokenizer = None
             encoder = model.vision_model
         case _:
@@ -134,8 +134,15 @@ def predict(model_name, model, tokenizer, processor, image):
                     preds = processor.tokenizer.decode(output_ids1[0], skip_special_tokens=True)
         case 'blip2':
             # BLIP-2 expects PIL input
-            pil_images = [to_pil_image(im.cpu()) for im in image]
-            inputs = processor(images=pil_images, return_tensors="pt").to(model.device, torch.float16)
+
+            # Convert to list of PIL images
+            if isinstance(image, torch.Tensor):
+                if image.dim() == 3:  # Single image
+                    image = [to_pil_image(image.cpu())]
+                else:
+                    image = [to_pil_image(im.cpu()) for im in image]
+
+            inputs = processor(images=image, return_tensors="pt").to(model.device, torch.float16)
             with torch.no_grad():
                 generated_ids = model.generate(**inputs, max_new_tokens=30)
             preds = processor.batch_decode(generated_ids, skip_special_tokens=True)
