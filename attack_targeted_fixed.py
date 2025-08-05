@@ -8,6 +8,7 @@ from torchvision.transforms.functional import to_pil_image
 from torchvision import transforms
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
+import matplotlib.pyplot as plt
 
 
 import argparse
@@ -25,6 +26,28 @@ resize_224 = transforms.Resize((224, 224), antialias=True)
 def sbert_similarity(sent1, sent2, model):
     embeddings = model.encode([sent1, sent2], convert_to_tensor=True, device=device)
     return F.cosine_similarity(embeddings[0], embeddings[1], dim=0)
+
+def visualize_attack(x_orig, x_adv, noise, index):
+    x_orig_np = x_orig.detach().cpu().squeeze().permute(1, 2, 0).numpy()
+    x_adv_np = x_adv.detach().cpu().squeeze().permute(1, 2, 0).numpy()
+    noise_np = noise.detach().cpu().squeeze().permute(1, 2, 0).numpy()
+
+    fig, axs = plt.subplots(1, 3, figsize=(12, 4))
+    axs[0].imshow(x_orig_np.clip(0, 1))
+    axs[0].set_title("Original Image")
+    axs[0].axis('off')
+
+    axs[1].imshow(noise_np / (2 * eps) + 0.5)  # Normalize noise to [0,1]
+    axs[1].set_title("Noise")
+    axs[1].axis('off')
+
+    axs[2].imshow(x_adv_np.clip(0, 1))
+    axs[2].set_title("Adversarial Image")
+    axs[2].axis('off')
+
+    plt.tight_layout()
+    plt.savefig(f'outputs/visualize_attack_{index}.png')
+    plt.close()
 
 def pgd(model, model_name, encoder, tokenizer, image_processor, image_mean, image_std, clip_model, sbert_model, loader, nb_epoch, eps, c = 0.1, targeted=True, lr=0.05, nb_imgs=1000, 
         projection=None, clip_weight = 0.6, sbert_weight = 0.4):
@@ -151,7 +174,21 @@ def pgd(model, model_name, encoder, tokenizer, image_processor, image_mean, imag
 
         torch.cuda.empty_cache()
 
+        # Vẽ biểu đồ loss
+        plt.figure(figsize=(8,5))
+        for i, loss_list in enumerate(total_losses):
+            plt.plot(loss_list, label=f'Sample {i+1}')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('PGD Adversarial Attack Loss per Epoch')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig('outputs/pgd_loss_curve.png')
+        plt.close()
+        
     return total_losses, clip_losses
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -172,6 +209,7 @@ if __name__ == '__main__':
     image_processor, tokenizer, model, encoder, image_mean, image_std = load_model(model_name=model_name)
     sbert_model = SentenceTransformer('all-MiniLM-L6-v2').to(device)
     dataloader = load_dataset(dataset, image_processor, batch_size=6)
+
     image_mean = torch.tensor(image_mean).view(3, 1, 1).to(device)
     image_std = torch.tensor(image_std).view(3, 1, 1).to(device)
 
